@@ -10,6 +10,9 @@ from datetime import datetime, timezone
 # Constants
 DEFAULT_CONNECT_TIMEOUT = 10
 DEFAULT_DATABSE = "Electricity"
+DEFAULT_READINGS_TABLE = "Readings"
+DEFAULT_EV_TABLE = "EV"
+DEFAULT_EV_CAPACITY = 580  # kWh
 
 MYSQL_CONF = "/etc/mysql/my.cnf"
 
@@ -54,7 +57,9 @@ def convert_timestamp(timestamp) -> datetime:
 def format_time_long(dt) -> str:
     """Return as 21-Jul-2025 10:45am"""
     return dt.strftime("%d-%b-%Y %I:%M%p")
+
 class HandleArgs:
+    """Handle command line arguments"""
     def __init__(self):
         self.parser = argparse.ArgumentParser()
         self.args = None
@@ -75,16 +80,34 @@ class HandleArgs:
             default=DEFAULT_CONNECT_TIMEOUT
         )
         options_group.add_argument("--use-socket", help="use Unix socket", action="store_true")
+        options_group.add_argument(
+            "--readings-table", help="table for readings", type=str, default=DEFAULT_READINGS_TABLE
+        )
+        options_group.add_argument(
+            "--ev-table", help="table for EV data", type=str, default=DEFAULT_EV_TABLE
+        )
 
     def _report(self, options_group):
         """Repoer options"""
         options_group.add_argument("-r", help="report on collected data", action="store_true")
         options_group.add_argument("--last-ten", help="last ten results", action="store_true")
+        options_group.add_argument(
+            "--ev-capacity", help="capacity of EV battery in kWh", type=float,
+            default=DEFAULT_EV_CAPACITY
+        )
 
     def _general(self, options_group):
         """General inputs"""
         options_group.add_argument("-d", help="debug logging", action="store_true")
         options_group.add_argument("-reading", help="current reading in kWh", type=float)
+        options_group.add_argument(
+            "--ev-charge", help="record EV charge in kWh", action="store_true"
+        )
+        options_group.add_argument("--start-level", help="EV start level in kWh", type=float)
+        options_group.add_argument("--end-level", help="EV end level in kWh", type=float)
+        options_group.add_argument(
+            "-test", help="test mode - do not store data", action="store_true"
+        )
 
     def parse_arguments(self):
         """Build argument groups and process the inputs"""
@@ -172,11 +195,29 @@ class DatabaseHandler:
     
     def _get_last_reading(self) -> int:
         """Get the last reading from the database"""
-        query = "SELECT reading FROM Readings ORDER BY timestamp DESC LIMIT 1;"
+        query = f"SELECT reading FROM {args.readings_table} ORDER BY timestamp DESC LIMIT 1;"
         self._run_query(query)
         if self.results_dict:
             return self.results_dict[1]["reading"]
         return 0
+
+    def _write_data(self, query, data, what="Meter reading"):
+        """Write data to the database"""
+        self.logger.info(f"Saving data for: {what}")
+        cursor = None
+        try:
+            cursor = self.cnx.cursor()
+            cursor.execute(query, data)
+            self.cnx.commit()
+        except (ProgrammingError, OperationalError) as e:
+            self.logger.error(f"Unable to store data for {what}. Error: {str(e)}")
+        except Exception as e:
+            self.logger.error(
+                f"Error {type(e).__name__} storing data for {what}. Error: {str(e)}"
+            )
+        finally:
+            if cursor:
+                cursor.close()
 
     def connect(self):
         """Connect to the database"""
@@ -247,37 +288,108 @@ class DatabaseHandler:
         changes = reading - last_reading
         timestamp = get_timestamp()
 
-        query = f"INSERT INTO Readings (timestamp, reading, changes) VALUES (%s, %s, %s);"
-        data = (timestamp, reading, changes)
-        self.logger.info("Saving data")
+        if changes < 0:
+            self.logger.warning(
+                f"New reading {reading} is less than last reading {last_reading}, no update made"
+            )
+            return
 
-        cursor = None
-        
-        try:
-            cursor = self.cnx.cursor()
-            cursor.execute(query, data)
-            self.cnx.commit()
-            self.logger.info("Data stored successfully")
-        except (ProgrammingError, OperationalError) as e:
-            self.logger.error("Unable to store data: %s", str(e))
-        except Exception as e:
-            self.logger.error("Error %s storing data: %s", type(e).__name__, str(e))
-        finally:
-            if cursor:
-                cursor.close()
+        query = (
+            f"INSERT INTO {args.readings_table} (timestamp, reading, changes) "
+            "VALUES (%s, %s, %s);"
+        )
+        data = (timestamp, reading, changes)
+        self._write_data(query, data, what="Meter reading")
+
+    def store_ev_reading(self, start_level, end_level):
+        """Store an EV charge event - probably change to share code with store_reading"""
+        timestamp = get_timestamp()
+
+        query = (
+            f"INSERT INTO {args.ev_table} (timestamp, start, end) "
+            "VALUES (%s, %s, %s);"
+        )
+        data = (timestamp, start_level, end_level)
+        self._write_data(query, data, what="EV charge")
+
+    def get_reading_summary(self):
+        """Get a summary of the readings"""
+        query = (
+            "SELECT FLOOR(SUM(changes)) AS used, "
+            "FLOOR(MIN(timestamp)) AS start_timestamp, FLOOR(MAX(timestamp)) AS end_timestamp "
+            f"FROM {args.readings_table};"
+        )
+        self._run_query(query)
+        return self.results_dict[1] if self.results_dict else {}
 
     def disconnect(self):
         """Close database connection"""
         if self.connected:
             self.cnx.close()
 
-def run_report():
+def report_summary(summary):
+    """Report the summary of readings"""
+    start_ts = summary.get("start_timestamp", None)
+    end_ts = summary.get("end_timestamp", None)
+    if start_ts is None or end_ts is None:
+        print("No data to report")
+        return
+
+    start_dt = convert_timestamp(summary["start_timestamp"])
+    end_dt = convert_timestamp(summary["end_timestamp"])
+    used = int(summary["used"])
+
+    print("\nSummary of readings")
+    print("-------------------")
+    print(f"  Start time : {format_time_long(start_dt)}")
+    print(f"  End time   : {format_time_long(end_dt)}")
+    print(f"  Total used : {used} kWh\n")
+
+    if start_ts == end_ts:
+        print("Only one reading in the database, no further report possible\n")
+        return
+
+    total_hours = (end_ts - start_ts) / 3600
+    avg_per_day = used / (total_hours / 24)
+    avg_per_month = avg_per_day * 30
+    avg_per_year = avg_per_day * 365
+    print(f"  Total time : {total_hours:.1f} hours")
+    print(f"  Average per day   : {avg_per_day:.1f} kWh")
+    print(f"  Average per month : {avg_per_month:.1f} kWh")
+    print(f"  Average per year  : {avg_per_year:.1f} kWh\n")
+
+def run_report(db_h):
     """Run a report on the collected data"""
-    logger.info("Not implemented yet")
-    pass
+    summary = db_h.get_reading_summary()
+    # print(summary)
+
+    if not summary or summary.get("start_timestamp", None) is None:
+        print("No data to report")
+        return
+
+    report_summary(summary)
 
 def add_data(db_h):
     """Add data to the database"""
+    if args.ev_charge:
+        if args.start_level is None or args.end_level is None:
+            logger.error("Both --start-level and --end-level must be provided to log EV charge")
+            return
+        if args.start_level < 0 or args.end_level < 0:
+            logger.error("Start and end levels must be positive values")
+            return
+        if args.start_level >= args.ev_capacity or args.end_level > args.ev_capacity:
+            logger.error(
+                f"Start and end levels must be less than the EV capacity of {args.ev_capacity} kWh"
+            )
+            return
+        if args.end_level <= args.start_level:
+            logger.error("End level must be greater than start level")
+            return
+
+        db_h.store_ev_reading(args.start_level, args.end_level)
+        return
+
     if not args.reading:
         logger.error("A reading must be provided with the -reading argument to add data")
         return
@@ -293,7 +405,7 @@ def main():
         logger.error("Database connection could not be established, exiting")
         return
     if args.r:
-        run_report()
+        run_report(db_h)
     else:
         add_data(db_h)
 
