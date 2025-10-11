@@ -12,9 +12,11 @@ DEFAULT_CONNECT_TIMEOUT = 10
 DEFAULT_DATABSE = "Electricity"
 DEFAULT_READINGS_TABLE = "Readings"
 DEFAULT_EV_TABLE = "EV"
-DEFAULT_EV_CAPACITY = 580  # kWh
+DEFAULT_EV_CAPACITY = 58  # kWh
 
 MYSQL_CONF = "/etc/mysql/my.cnf"
+
+STARS = "*" * 132
 
 args = None
 
@@ -322,6 +324,19 @@ class DatabaseHandler:
         self._run_query(query)
         return self.results_dict[1] if self.results_dict else {}
 
+    def get_ev_summary(self):
+        """Get a summary of the EV charges"""
+        query = (
+            "SELECT COUNT(*) AS charges, "
+            "FLOOR(SUM(end - start)) AS total_charged, "
+            "FLOOR(AVG(end - start)) AS avg_charge, "
+            "FLOOR(MIN(timestamp)) AS start_timestamp, "
+            "FLOOR(MAX(timestamp)) AS end_timestamp "
+            f"FROM {args.ev_table};"
+        )
+        self._run_query(query)
+        return self.results_dict[1] if self.results_dict else {}
+
     def disconnect(self):
         """Close database connection"""
         if self.connected:
@@ -353,10 +368,51 @@ def report_summary(summary):
     avg_per_day = used / (total_hours / 24)
     avg_per_month = avg_per_day * 30
     avg_per_year = avg_per_day * 365
-    print(f"  Total time : {total_hours:.1f} hours")
+    print(f"  Total time        : {total_hours:.1f} hours")
     print(f"  Average per day   : {avg_per_day:.1f} kWh")
     print(f"  Average per month : {avg_per_month:.1f} kWh")
     print(f"  Average per year  : {avg_per_year:.1f} kWh\n")
+
+def get_kwh_from_percent(percent, capacity):    
+    """Get kWh from a percentage of the capacity"""
+    return (percent / 100) * capacity
+
+def report_ev_summary(ev_summary):
+    """Report the summary of EV charges"""
+    charges = ev_summary.get("charges", 0)
+    total_charged = get_kwh_from_percent(ev_summary.get("total_charged", 0), args.ev_capacity)
+    avg_charge = get_kwh_from_percent(ev_summary.get("avg_charge", 0), args.ev_capacity)
+
+    start_ts = ev_summary.get("start_timestamp", None)
+    end_ts = ev_summary.get("end_timestamp", None)
+    if start_ts is None or end_ts is None:
+        print("No data to report")
+        return
+
+    start_dt = convert_timestamp(ev_summary["start_timestamp"])
+    end_dt = convert_timestamp(ev_summary["end_timestamp"])
+
+    print("\nSummary of EV charges")
+    print("---------------------")
+    print(f"  Start time        : {format_time_long(start_dt)}")
+    print(f"  End time          : {format_time_long(end_dt)}")
+    print(f"  Number of charges : {charges}")
+    print(f"  Total charged     : {total_charged} kWh")
+    print(f"  Average charge    : {avg_charge} kWh")
+    print(f"  EV Capacity       : {args.ev_capacity} kWh\n")
+
+    if start_ts == end_ts:
+        print("Only one reading in the database, no further report possible\n")
+        return
+
+    total_hours = (end_ts - start_ts) / 3600
+    avg_per_day = int(total_charged) / (total_hours / 24)
+    avg_per_month = avg_per_day * 30
+    avg_per_year = avg_per_day * 365
+    print(f"  Total time        : {total_hours:.1f} hours")
+    print(f"  Average per day   : {avg_per_day:.1f} kWh")
+    print(f"  Average per month : {avg_per_month:.1f} kWh")
+    print(f"  Average per year  : {avg_per_year:.1f} kWh\n")        
 
 def run_report(db_h):
     """Run a report on the collected data"""
@@ -368,6 +424,13 @@ def run_report(db_h):
         return
 
     report_summary(summary)
+
+    ev_summary = db_h.get_ev_summary()
+    if not ev_summary or ev_summary.get("charges", None) is None:    
+        print("No EV data to report")
+        return
+
+    report_ev_summary(ev_summary)
 
 def add_data(db_h):
     """Add data to the database"""
@@ -425,8 +488,11 @@ if __name__ == "__main__":
     stdout_h.setFormatter(CustomFormatter())
     logger.addHandler(stdout_h)
     
-    logger.info("Script started")
+    print(
+        f"\n{STARS}\nEnergy Tracker - track electricity usage and EV charging\n{STARS}"
+    )
         
     main()
 
-    logger.info("Script finished successfully")
+
+    print("")
