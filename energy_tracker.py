@@ -18,6 +18,13 @@ MYSQL_CONF = "/etc/mysql/my.cnf"
 
 STARS = "*" * 132
 
+DATA = {
+    "total_used": 0,
+    "start_time": None,
+    "end_time": None,
+    "total_ev_charged": 0,
+}
+
 args = None
 
 def pad_string(input_string, pad_length, pad_char=" ") -> str:
@@ -337,6 +344,29 @@ class DatabaseHandler:
         self._run_query(query)
         return self.results_dict[1] if self.results_dict else {}
 
+    def get_last_ten(self):
+        """Get last 10 readings"""
+        query = (
+            f"SELECT timestamp, reading, changes FROM {args.readings_table} "
+            "ORDER BY timestamp DESC LIMIT 10;"
+        )
+        self._run_query(query)
+        if not self.results_dict:
+            print("No data to report")
+            return
+
+        print("\nLast 10 readings")
+        print("----------------")
+        print(f"{'Timestamp':<20} {'Reading (kWh)':<15} {'Changes (kWh)':<15}")
+        print("-" * 50)
+        for i in range(1, len(self.results_dict) + 1):
+            row = self.results_dict[i]
+            ts = convert_timestamp(row["timestamp"])
+            reading = row["reading"]
+            changes = row["changes"]
+            print(f"{format_time_long(ts):<20} {reading:<15} {changes:<15}")
+        print("")
+
     def disconnect(self):
         """Close database connection"""
         if self.connected:
@@ -356,9 +386,9 @@ def report_summary(summary):
 
     print("\nSummary of readings")
     print("-------------------")
-    print(f"  Start time : {format_time_long(start_dt)}")
-    print(f"  End time   : {format_time_long(end_dt)}")
-    print(f"  Total used : {used} kWh\n")
+    print(f"  Start time        : {format_time_long(start_dt)}")
+    print(f"  End time          : {format_time_long(end_dt)}")
+    print(f"  Total used        : {used} kWh\n")
 
     if start_ts == end_ts:
         print("Only one reading in the database, no further report possible\n")
@@ -372,6 +402,11 @@ def report_summary(summary):
     print(f"  Average per day   : {avg_per_day:.1f} kWh")
     print(f"  Average per month : {avg_per_month:.1f} kWh")
     print(f"  Average per year  : {avg_per_year:.1f} kWh\n")
+
+    # Store for final summary
+    DATA["total_used"] = used
+    DATA["start_time"] = start_dt
+    DATA["end_time"] = end_dt
 
 def get_kwh_from_percent(percent, capacity):    
     """Get kWh from a percentage of the capacity"""
@@ -412,7 +447,55 @@ def report_ev_summary(ev_summary):
     print(f"  Total time        : {total_hours:.1f} hours")
     print(f"  Average per day   : {avg_per_day:.1f} kWh")
     print(f"  Average per month : {avg_per_month:.1f} kWh")
-    print(f"  Average per year  : {avg_per_year:.1f} kWh\n")        
+    print(f"  Average per year  : {avg_per_year:.1f} kWh\n")
+
+    # Store for final summary
+    DATA["total_ev_charged"] = total_charged        
+
+def report_last_ten(db_h):
+    """Get last 10 readings)"""
+    db_h.get_last_ten()
+
+def final_summary():
+    """Final summary of all data"""
+    print("\nOverall Summary")
+    print("---------------")
+    total_used = DATA.get("total_used", 0)
+    start_time = DATA.get("start_time", None)
+    end_time = DATA.get("end_time", None)
+    total_ev_charged = DATA.get("total_ev_charged", 0)
+
+    if not start_time or not end_time:
+        print("No data to report")
+        return
+
+    print(f"  Start time        : {format_time_long(start_time)}")
+    print(f"  End time          : {format_time_long(end_time)}")
+    print(f"  Total electricity : {total_used} kWh")
+    print(f"  Total EV charged  : {total_ev_charged} kWh")
+
+    if total_used == 0:
+        print("No electricity usage data to report further")
+        return
+
+    percent_ev = (total_ev_charged / total_used) * 100
+    print(f"  Percentage EV     : {percent_ev:.1f}%\n")
+
+    # Show day/month/year stats with and without EV charging
+    total_hours = int((end_time.timestamp() - start_time.timestamp()) / 3600)
+    avg_per_day = total_used / (total_hours / 24)
+    avg_per_month = avg_per_day * 30
+    avg_per_year = avg_per_day * 365
+    avg_per_day_no_ev = (total_used - total_ev_charged) / int((total_hours / 24))
+    avg_per_month_no_ev = avg_per_day_no_ev * 30
+    avg_per_year_no_ev = avg_per_day_no_ev * 365    
+    print(f"  Average per day (with EV)   : {avg_per_day:.1f} kWh")
+    print(f"  Average per month (with EV) : {avg_per_month:.1f} kWh")
+    print(f"  Average per year (with EV)  : {avg_per_year:.1f} kWh\n")
+    print(f"  Average per day (no EV)     : {avg_per_day_no_ev:.1f} kWh")
+    print(f"  Average per month (no EV)   : {avg_per_month_no_ev:.1f} kWh")
+    print(f"  Average per year (no EV)    : {avg_per_year_no_ev:.1f} kWh\n")    
+
 
 def run_report(db_h):
     """Run a report on the collected data"""
@@ -423,14 +506,20 @@ def run_report(db_h):
         print("No data to report")
         return
 
+    if args.last_ten:
+        report_last_ten(db_h)
+        return
+
     report_summary(summary)
 
     ev_summary = db_h.get_ev_summary()
     if not ev_summary or ev_summary.get("charges", None) is None:    
         print("No EV data to report")
+        final_summary()
         return
 
     report_ev_summary(ev_summary)
+    final_summary()
 
 def add_data(db_h):
     """Add data to the database"""
@@ -441,9 +530,9 @@ def add_data(db_h):
         if args.start_level < 0 or args.end_level < 0:
             logger.error("Start and end levels must be positive values")
             return
-        if args.start_level >= args.ev_capacity or args.end_level > args.ev_capacity:
+        if args.start_level > 100 or args.end_level < 0:
             logger.error(
-                f"Start and end levels must be less than the EV capacity of {args.ev_capacity} kWh"
+                "Start and end levels must be a percentage (between 0 and 100)"
             )
             return
         if args.end_level <= args.start_level:
