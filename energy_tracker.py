@@ -10,8 +10,20 @@ from datetime import datetime, timezone
 # Constants
 DEFAULT_CONNECT_TIMEOUT = 10
 DEFAULT_DATABSE = "Electricity"
+DEFAULT_READINGS_TABLE = "Readings"
+DEFAULT_EV_TABLE = "EV"
+DEFAULT_EV_CAPACITY = 58  # kWh
 
 MYSQL_CONF = "/etc/mysql/my.cnf"
+
+STARS = "*" * 132
+
+DATA = {
+    "total_used": 0,
+    "start_time": None,
+    "end_time": None,
+    "total_ev_charged": 0,
+}
 
 args = None
 
@@ -54,7 +66,9 @@ def convert_timestamp(timestamp) -> datetime:
 def format_time_long(dt) -> str:
     """Return as 21-Jul-2025 10:45am"""
     return dt.strftime("%d-%b-%Y %I:%M%p")
+
 class HandleArgs:
+    """Handle command line arguments"""
     def __init__(self):
         self.parser = argparse.ArgumentParser()
         self.args = None
@@ -75,16 +89,34 @@ class HandleArgs:
             default=DEFAULT_CONNECT_TIMEOUT
         )
         options_group.add_argument("--use-socket", help="use Unix socket", action="store_true")
+        options_group.add_argument(
+            "--readings-table", help="table for readings", type=str, default=DEFAULT_READINGS_TABLE
+        )
+        options_group.add_argument(
+            "--ev-table", help="table for EV data", type=str, default=DEFAULT_EV_TABLE
+        )
 
     def _report(self, options_group):
         """Repoer options"""
         options_group.add_argument("-r", help="report on collected data", action="store_true")
         options_group.add_argument("--last-ten", help="last ten results", action="store_true")
+        options_group.add_argument(
+            "--ev-capacity", help="capacity of EV battery in kWh", type=float,
+            default=DEFAULT_EV_CAPACITY
+        )
 
     def _general(self, options_group):
         """General inputs"""
         options_group.add_argument("-d", help="debug logging", action="store_true")
         options_group.add_argument("-reading", help="current reading in kWh", type=float)
+        options_group.add_argument(
+            "--ev-charge", help="record EV charge in kWh", action="store_true"
+        )
+        options_group.add_argument("--start-level", help="EV start level in kWh", type=float)
+        options_group.add_argument("--end-level", help="EV end level in kWh", type=float)
+        options_group.add_argument(
+            "-test", help="test mode - do not store data", action="store_true"
+        )
 
     def parse_arguments(self):
         """Build argument groups and process the inputs"""
@@ -172,11 +204,29 @@ class DatabaseHandler:
     
     def _get_last_reading(self) -> int:
         """Get the last reading from the database"""
-        query = "SELECT reading FROM Readings ORDER BY timestamp DESC LIMIT 1;"
+        query = f"SELECT reading FROM {args.readings_table} ORDER BY timestamp DESC LIMIT 1;"
         self._run_query(query)
         if self.results_dict:
             return self.results_dict[1]["reading"]
         return 0
+
+    def _write_data(self, query, data, what="Meter reading"):
+        """Write data to the database"""
+        self.logger.info(f"Saving data for: {what}")
+        cursor = None
+        try:
+            cursor = self.cnx.cursor()
+            cursor.execute(query, data)
+            self.cnx.commit()
+        except (ProgrammingError, OperationalError) as e:
+            self.logger.error(f"Unable to store data for {what}. Error: {str(e)}")
+        except Exception as e:
+            self.logger.error(
+                f"Error {type(e).__name__} storing data for {what}. Error: {str(e)}"
+            )
+        finally:
+            if cursor:
+                cursor.close()
 
     def connect(self):
         """Connect to the database"""
@@ -247,37 +297,251 @@ class DatabaseHandler:
         changes = reading - last_reading
         timestamp = get_timestamp()
 
-        query = f"INSERT INTO Readings (timestamp, reading, changes) VALUES (%s, %s, %s);"
-        data = (timestamp, reading, changes)
-        self.logger.info("Saving data")
+        if changes < 0:
+            self.logger.warning(
+                f"New reading {reading} is less than last reading {last_reading}, no update made"
+            )
+            return
 
-        cursor = None
-        
-        try:
-            cursor = self.cnx.cursor()
-            cursor.execute(query, data)
-            self.cnx.commit()
-            self.logger.info("Data stored successfully")
-        except (ProgrammingError, OperationalError) as e:
-            self.logger.error("Unable to store data: %s", str(e))
-        except Exception as e:
-            self.logger.error("Error %s storing data: %s", type(e).__name__, str(e))
-        finally:
-            if cursor:
-                cursor.close()
+        query = (
+            f"INSERT INTO {args.readings_table} (timestamp, reading, changes) "
+            "VALUES (%s, %s, %s);"
+        )
+        data = (timestamp, reading, changes)
+        self._write_data(query, data, what="Meter reading")
+
+    def store_ev_reading(self, start_level, end_level):
+        """Store an EV charge event - probably change to share code with store_reading"""
+        timestamp = get_timestamp()
+
+        query = (
+            f"INSERT INTO {args.ev_table} (timestamp, start, end) "
+            "VALUES (%s, %s, %s);"
+        )
+        data = (timestamp, start_level, end_level)
+        self._write_data(query, data, what="EV charge")
+
+    def get_reading_summary(self):
+        """Get a summary of the readings"""
+        query = (
+            "SELECT FLOOR(SUM(changes)) AS used, "
+            "FLOOR(MIN(timestamp)) AS start_timestamp, FLOOR(MAX(timestamp)) AS end_timestamp "
+            f"FROM {args.readings_table};"
+        )
+        self._run_query(query)
+        return self.results_dict[1] if self.results_dict else {}
+
+    def get_ev_summary(self):
+        """Get a summary of the EV charges"""
+        query = (
+            "SELECT COUNT(*) AS charges, "
+            "FLOOR(SUM(end - start)) AS total_charged, "
+            "FLOOR(AVG(end - start)) AS avg_charge, "
+            "FLOOR(MIN(timestamp)) AS start_timestamp, "
+            "FLOOR(MAX(timestamp)) AS end_timestamp "
+            f"FROM {args.ev_table};"
+        )
+        self._run_query(query)
+        return self.results_dict[1] if self.results_dict else {}
+
+    def get_last_ten(self):
+        """Get last 10 readings"""
+        query = (
+            f"SELECT timestamp, reading, changes FROM {args.readings_table} "
+            "ORDER BY timestamp DESC LIMIT 10;"
+        )
+        self._run_query(query)
+        if not self.results_dict:
+            print("No data to report")
+            return
+
+        print("\nLast 10 readings")
+        print("----------------")
+        print(f"{'Timestamp':<20} {'Reading (kWh)':<15} {'Changes (kWh)':<15}")
+        print("-" * 50)
+        for i in range(1, len(self.results_dict) + 1):
+            row = self.results_dict[i]
+            ts = convert_timestamp(row["timestamp"])
+            reading = row["reading"]
+            changes = row["changes"]
+            print(f"{format_time_long(ts):<20} {reading:<15} {changes:<15}")
+        print("")
 
     def disconnect(self):
         """Close database connection"""
         if self.connected:
             self.cnx.close()
 
-def run_report():
+def report_summary(summary):
+    """Report the summary of readings"""
+    start_ts = summary.get("start_timestamp", None)
+    end_ts = summary.get("end_timestamp", None)
+    if start_ts is None or end_ts is None:
+        print("No data to report")
+        return
+
+    start_dt = convert_timestamp(summary["start_timestamp"])
+    end_dt = convert_timestamp(summary["end_timestamp"])
+    used = int(summary["used"])
+
+    print("\nSummary of readings")
+    print("-------------------")
+    print(f"  Start time        : {format_time_long(start_dt)}")
+    print(f"  End time          : {format_time_long(end_dt)}")
+    print(f"  Total used        : {used} kWh\n")
+
+    if start_ts == end_ts:
+        print("Only one reading in the database, no further report possible\n")
+        return
+
+    total_hours = (end_ts - start_ts) / 3600
+    avg_per_day = used / (total_hours / 24)
+    avg_per_month = avg_per_day * 30
+    avg_per_year = avg_per_day * 365
+    print(f"  Total time        : {total_hours:.1f} hours")
+    print(f"  Average per day   : {avg_per_day:.1f} kWh")
+    print(f"  Average per month : {avg_per_month:.1f} kWh")
+    print(f"  Average per year  : {avg_per_year:.1f} kWh\n")
+
+    # Store for final summary
+    DATA["total_used"] = used
+    DATA["start_time"] = start_dt
+    DATA["end_time"] = end_dt
+
+def get_kwh_from_percent(percent, capacity):    
+    """Get kWh from a percentage of the capacity"""
+    return (percent / 100) * capacity
+
+def report_ev_summary(ev_summary):
+    """Report the summary of EV charges"""
+    charges = ev_summary.get("charges", 0)
+    total_charged = get_kwh_from_percent(ev_summary.get("total_charged", 0), args.ev_capacity)
+    avg_charge = get_kwh_from_percent(ev_summary.get("avg_charge", 0), args.ev_capacity)
+
+    start_ts = ev_summary.get("start_timestamp", None)
+    end_ts = ev_summary.get("end_timestamp", None)
+    if start_ts is None or end_ts is None:
+        print("No data to report")
+        return
+
+    start_dt = convert_timestamp(ev_summary["start_timestamp"])
+    end_dt = convert_timestamp(ev_summary["end_timestamp"])
+
+    print("\nSummary of EV charges")
+    print("---------------------")
+    print(f"  Start time        : {format_time_long(start_dt)}")
+    print(f"  End time          : {format_time_long(end_dt)}")
+    print(f"  Number of charges : {charges}")
+    print(f"  Total charged     : {total_charged} kWh")
+    print(f"  Average charge    : {avg_charge} kWh")
+    print(f"  EV Capacity       : {args.ev_capacity} kWh\n")
+
+    if start_ts == end_ts:
+        print("Only one reading in the database, no further report possible\n")
+        return
+
+    total_hours = (end_ts - start_ts) / 3600
+    avg_per_day = int(total_charged) / (total_hours / 24)
+    avg_per_month = avg_per_day * 30
+    avg_per_year = avg_per_day * 365
+    print(f"  Total time        : {total_hours:.1f} hours")
+    print(f"  Average per day   : {avg_per_day:.1f} kWh")
+    print(f"  Average per month : {avg_per_month:.1f} kWh")
+    print(f"  Average per year  : {avg_per_year:.1f} kWh\n")
+
+    # Store for final summary
+    DATA["total_ev_charged"] = total_charged        
+
+def report_last_ten(db_h):
+    """Get last 10 readings)"""
+    db_h.get_last_ten()
+
+def final_summary():
+    """Final summary of all data"""
+    print("\nOverall Summary")
+    print("---------------")
+    total_used = DATA.get("total_used", 0)
+    start_time = DATA.get("start_time", None)
+    end_time = DATA.get("end_time", None)
+    total_ev_charged = DATA.get("total_ev_charged", 0)
+
+    if not start_time or not end_time:
+        print("No data to report")
+        return
+
+    print(f"  Start time        : {format_time_long(start_time)}")
+    print(f"  End time          : {format_time_long(end_time)}")
+    print(f"  Total electricity : {total_used} kWh")
+    print(f"  Total EV charged  : {total_ev_charged} kWh")
+
+    if total_used == 0:
+        print("No electricity usage data to report further")
+        return
+
+    percent_ev = (total_ev_charged / total_used) * 100
+    print(f"  Percentage EV     : {percent_ev:.1f}%\n")
+
+    # Show day/month/year stats with and without EV charging
+    total_hours = int((end_time.timestamp() - start_time.timestamp()) / 3600)
+    avg_per_day = total_used / (total_hours / 24)
+    avg_per_month = avg_per_day * 30
+    avg_per_year = avg_per_day * 365
+    avg_per_day_no_ev = (total_used - total_ev_charged) / int((total_hours / 24))
+    avg_per_month_no_ev = avg_per_day_no_ev * 30
+    avg_per_year_no_ev = avg_per_day_no_ev * 365    
+    print(f"  Average per day (with EV)   : {avg_per_day:.1f} kWh")
+    print(f"  Average per month (with EV) : {avg_per_month:.1f} kWh")
+    print(f"  Average per year (with EV)  : {avg_per_year:.1f} kWh\n")
+    print(f"  Average per day (no EV)     : {avg_per_day_no_ev:.1f} kWh")
+    print(f"  Average per month (no EV)   : {avg_per_month_no_ev:.1f} kWh")
+    print(f"  Average per year (no EV)    : {avg_per_year_no_ev:.1f} kWh\n")    
+
+
+def run_report(db_h):
     """Run a report on the collected data"""
-    logger.info("Not implemented yet")
-    pass
+    summary = db_h.get_reading_summary()
+    # print(summary)
+
+    if not summary or summary.get("start_timestamp", None) is None:
+        print("No data to report")
+        return
+
+    if args.last_ten:
+        report_last_ten(db_h)
+        return
+
+    report_summary(summary)
+
+    ev_summary = db_h.get_ev_summary()
+    if not ev_summary or ev_summary.get("charges", None) is None:    
+        print("No EV data to report")
+        final_summary()
+        return
+
+    report_ev_summary(ev_summary)
+    final_summary()
 
 def add_data(db_h):
     """Add data to the database"""
+    if args.ev_charge:
+        if args.start_level is None or args.end_level is None:
+            logger.error("Both --start-level and --end-level must be provided to log EV charge")
+            return
+        if args.start_level < 0 or args.end_level < 0:
+            logger.error("Start and end levels must be positive values")
+            return
+        if args.start_level > 100 or args.end_level < 0:
+            logger.error(
+                "Start and end levels must be a percentage (between 0 and 100)"
+            )
+            return
+        if args.end_level <= args.start_level:
+            logger.error("End level must be greater than start level")
+            return
+
+        db_h.store_ev_reading(args.start_level, args.end_level)
+        return
+
     if not args.reading:
         logger.error("A reading must be provided with the -reading argument to add data")
         return
@@ -293,7 +557,7 @@ def main():
         logger.error("Database connection could not be established, exiting")
         return
     if args.r:
-        run_report()
+        run_report(db_h)
     else:
         add_data(db_h)
 
@@ -313,8 +577,11 @@ if __name__ == "__main__":
     stdout_h.setFormatter(CustomFormatter())
     logger.addHandler(stdout_h)
     
-    logger.info("Script started")
+    print(
+        f"\n{STARS}\nEnergy Tracker - track electricity usage and EV charging\n{STARS}"
+    )
         
     main()
 
-    logger.info("Script finished successfully")
+
+    print("")
